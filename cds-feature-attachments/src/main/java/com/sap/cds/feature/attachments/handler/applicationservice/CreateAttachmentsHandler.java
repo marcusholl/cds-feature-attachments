@@ -5,6 +5,7 @@ package com.sap.cds.feature.attachments.handler.applicationservice;
 
 import com.sap.cds.CdsData;
 import com.sap.cds.feature.attachments.handler.applicationservice.helper.ExtendedErrorStatuses;
+import com.sap.cds.feature.attachments.handler.applicationservice.helper.FilenameDeduplicator;
 import com.sap.cds.feature.attachments.handler.applicationservice.helper.ModifyApplicationHandlerHelper;
 import com.sap.cds.feature.attachments.handler.applicationservice.helper.ReadonlyDataContextEnhancer;
 import com.sap.cds.feature.attachments.handler.applicationservice.helper.ThreadDataStorageReader;
@@ -23,6 +24,7 @@ import com.sap.cds.services.handler.annotations.Before;
 import com.sap.cds.services.handler.annotations.HandlerOrder;
 import com.sap.cds.services.handler.annotations.On;
 import com.sap.cds.services.handler.annotations.ServiceName;
+import com.sap.cds.services.persistence.PersistenceService;
 import com.sap.cds.services.runtime.CdsRuntime;
 import com.sap.cds.services.utils.OrderConstants;
 import java.util.ArrayList;
@@ -43,16 +45,22 @@ public class CreateAttachmentsHandler implements EventHandler {
   private final ThreadDataStorageReader storageReader;
   private final String defaultMaxSize;
   private final CdsRuntime cdsRuntime;
+  private final PersistenceService persistence;
+  private final boolean deduplicateFileNames;
 
   public CreateAttachmentsHandler(
       ModifyAttachmentEventFactory eventFactory,
       ThreadDataStorageReader storageReader,
       String defaultMaxSize,
-      CdsRuntime cdsRuntime) {
+      CdsRuntime cdsRuntime,
+      PersistenceService persistence,
+      boolean deduplicateFileNames) {
     this.eventFactory = eventFactory;
     this.storageReader = storageReader;
     this.defaultMaxSize = defaultMaxSize;
     this.cdsRuntime = cdsRuntime;
+    this.persistence = persistence;
+    this.deduplicateFileNames = deduplicateFileNames;
   }
 
   @Before
@@ -63,6 +71,19 @@ public class CreateAttachmentsHandler implements EventHandler {
     // field in data
     ReadonlyDataContextEnhancer.preserveReadonlyFields(
         context.getTarget(), data, storageReader.get());
+  }
+
+  @Before(event = CqnService.EVENT_CREATE)
+  @HandlerOrder(HandlerOrder.EARLY)
+  void processBeforeForDeduplication(CdsCreateEventContext context, List<CdsData> data) {
+    if (!deduplicateFileNames) {
+      return;
+    }
+    logger.debug(
+        "Deduplicating filenames before {} event for entity {}",
+        context.getEvent(),
+        context.getTarget());
+    FilenameDeduplicator.deduplicate(context.getModel(), context.getTarget(), data, persistence);
   }
 
   @Before(event = {CqnService.EVENT_CREATE, DraftService.EVENT_DRAFT_NEW})

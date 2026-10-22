@@ -17,6 +17,7 @@ import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 import com.sap.cds.CdsData;
+import com.sap.cds.Result;
 import com.sap.cds.feature.attachments.generated.cds4j.sap.attachments.Attachments;
 import com.sap.cds.feature.attachments.generated.test.cds4j.unit.test.Events;
 import com.sap.cds.feature.attachments.generated.test.cds4j.unit.test.Events_;
@@ -33,12 +34,14 @@ import com.sap.cds.feature.attachments.handler.applicationservice.modifyevents.M
 import com.sap.cds.feature.attachments.handler.applicationservice.modifyevents.ModifyAttachmentEventFactory;
 import com.sap.cds.feature.attachments.handler.applicationservice.readhelper.CountingInputStream;
 import com.sap.cds.feature.attachments.handler.helper.RuntimeHelper;
+import com.sap.cds.ql.cqn.CqnSelect;
 import com.sap.cds.reflect.CdsEntity;
 import com.sap.cds.services.ErrorStatuses;
 import com.sap.cds.services.EventContext;
 import com.sap.cds.services.ServiceException;
 import com.sap.cds.services.cds.ApplicationService;
 import com.sap.cds.services.cds.CdsCreateEventContext;
+import com.sap.cds.services.persistence.PersistenceService;
 import com.sap.cds.services.request.ParameterInfo;
 import com.sap.cds.services.runtime.CdsRuntime;
 import java.io.ByteArrayInputStream;
@@ -47,6 +50,7 @@ import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.List;
+import java.util.UUID;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -63,6 +67,7 @@ class CreateAttachmentsHandlerTest {
   private CdsCreateEventContext createContext;
   private ModifyAttachmentEvent event;
   private ThreadDataStorageReader storageReader;
+  private PersistenceService persistence;
 
   @BeforeAll
   static void classSetup() {
@@ -73,12 +78,18 @@ class CreateAttachmentsHandlerTest {
   void setup() {
     eventFactory = mock(ModifyAttachmentEventFactory.class);
     storageReader = mock(ThreadDataStorageReader.class);
+    persistence = mock(PersistenceService.class);
+    Result emptyResult = mock(Result.class);
+    when(emptyResult.listOf(CdsData.class)).thenReturn(List.of());
+    when(persistence.run(any(CqnSelect.class))).thenReturn(emptyResult);
     cut =
         new CreateAttachmentsHandler(
             eventFactory,
             storageReader,
             ModifyApplicationHandlerHelper.DEFAULT_SIZE_WITH_SCANNER,
-            runtime);
+            runtime,
+            persistence,
+            false);
 
     createContext = mock(CdsCreateEventContext.class);
     event = mock(ModifyAttachmentEvent.class);
@@ -363,12 +374,91 @@ class CreateAttachmentsHandlerTest {
           .when(() -> AttachmentValidationHelper.validateMediaAttachments(entity, data, runtime))
           .thenAnswer(invocation -> null);
       // when
-      new CreateAttachmentsHandler(eventFactory, storageReader, "400MB", runtime)
+      new CreateAttachmentsHandler(
+              eventFactory, storageReader, "400MB", runtime, persistence, false)
           .processBeforeForMetadata(context, data);
       // then
       helper.verify(
           () -> AttachmentValidationHelper.validateMediaAttachments(entity, data, runtime));
     }
+  }
+
+  @Test
+  void processBeforeForDeduplication_flagDisabled_noPersistenceInteraction() {
+    // cut is constructed with deduplicateFileNames=false in @BeforeEach
+    getEntityAndMockContext(RootTable_.CDS_NAME);
+
+    RootTable root = RootTable.create();
+    root.setId(UUID.randomUUID().toString());
+    Attachments attachment = Attachments.create();
+    attachment.setFileName("report.pdf");
+    attachment.put("up__ID", root.getId());
+    root.setAttachments(List.of(attachment));
+
+    cut.processBeforeForDeduplication(createContext, List.of(root));
+
+    verifyNoInteractions(persistence);
+    assertThat(attachment.getFileName()).isEqualTo("report.pdf");
+  }
+
+  @Test
+  void processBeforeForDeduplication_flagEnabled_noCollision_unchanged() {
+    getEntityAndMockContext(RootTable_.CDS_NAME);
+    CreateAttachmentsHandler cutWithDedup =
+        new CreateAttachmentsHandler(
+            eventFactory,
+            storageReader,
+            ModifyApplicationHandlerHelper.DEFAULT_SIZE_WITH_SCANNER,
+            runtime,
+            persistence,
+            true);
+    when(createContext.getModel()).thenReturn(runtime.getCdsModel());
+
+    RootTable root = RootTable.create();
+    root.setId(UUID.randomUUID().toString());
+    Attachments attachment = Attachments.create();
+    attachment.setFileName("report.pdf");
+    attachment.put("up__ID", root.getId());
+    root.setAttachments(List.of(attachment));
+
+    cutWithDedup.processBeforeForDeduplication(createContext, List.of(root));
+
+    assertThat(attachment.getFileName()).isEqualTo("report.pdf");
+  }
+
+  @Test
+  void processBeforeForDeduplication_flagEnabled_collision_renames() {
+    getEntityAndMockContext(RootTable_.CDS_NAME);
+    CreateAttachmentsHandler cutWithDedup =
+        new CreateAttachmentsHandler(
+            eventFactory,
+            storageReader,
+            ModifyApplicationHandlerHelper.DEFAULT_SIZE_WITH_SCANNER,
+            runtime,
+            persistence,
+            true);
+    when(createContext.getModel()).thenReturn(runtime.getCdsModel());
+
+    String parentId = UUID.randomUUID().toString();
+
+    CdsData existing = CdsData.create();
+    existing.put(Attachments.FILE_NAME, "report.pdf");
+    existing.put("up__ID", parentId);
+
+    Result dbResult = mock(Result.class);
+    when(dbResult.listOf(CdsData.class)).thenReturn(List.of(existing));
+    when(persistence.run(any(CqnSelect.class))).thenReturn(dbResult);
+
+    RootTable root = RootTable.create();
+    root.setId(parentId);
+    Attachments attachment = Attachments.create();
+    attachment.setFileName("report.pdf");
+    attachment.put("up__ID", parentId);
+    root.setAttachments(List.of(attachment));
+
+    cutWithDedup.processBeforeForDeduplication(createContext, List.of(root));
+
+    assertThat(attachment.getFileName()).isEqualTo("report-1.pdf");
   }
 
   private void getEntityAndMockContext(String cdsName) {
